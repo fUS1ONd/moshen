@@ -66,7 +66,15 @@ func handleVShareLink(names map[string]int, url *url.URL, scheme string, proxy m
 	}
 	fakeType := strings.ToLower(query.Get("headerType"))
 	if network == "tcp" && fakeType == "http" {
+		// tcp + headerType=http — это HTTP-обфускация поверх TCP, ей отвечает
+		// network: http с http-opts.
 		network = "http"
+	} else if network == "http" {
+		// А голый type=http в share-ссылке означает транспорт HTTP/2 — ему
+		// отвечает network: h2 с h2-opts. Без этой ветки ссылка молча
+		// превращалась в HTTP-обфускацию. В конвертере VMess такой маппинг
+		// есть (converter.go), в VLESS его забыли.
+		network = "h2"
 	}
 	proxy["network"] = network
 	switch network {
