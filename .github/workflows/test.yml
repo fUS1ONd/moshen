@@ -1,17 +1,9 @@
+# Полная матрица совместимости апстрима: 6 ОС × 7 версий Go = 42 джобы.
+# Гонять её на каждый пуш бессмысленно дорого, поэтому запуск только вручную —
+# перед релизом или при обновлении зависимостей. Повседневную проверку делает ci.yml.
 name: Test
 on:
-  push:
-    paths-ignore:
-      - "docs/**"
-      - "README.md"
-      - ".github/ISSUE_TEMPLATE/**"
-    branches:
-      - Alpha
-    tags:
-      - "v*"
-  pull_request:
-    branches:
-      - Alpha
+  workflow_dispatch:
 
 jobs:
   test:

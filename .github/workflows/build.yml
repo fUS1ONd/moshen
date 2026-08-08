@@ -1,3 +1,6 @@
+# Тяжёлая сборка бинарников под все платформы. Запускается только на релиз:
+# пуш тега `v*` (основной путь) или ручной workflow_dispatch.
+# Быстрая проверка кода на ветках и PR живёт в ci.yml — она в разы дешевле.
 name: Build
 on:
   workflow_dispatch:
@@ -6,17 +9,8 @@ on:
         description: "Tag version to release"
         required: true
   push:
-    paths-ignore:
-      - "docs/**"
-      - "README.md"
-      - ".github/ISSUE_TEMPLATE/**"
-    branches:
-      - Alpha
     tags:
       - "v*"
-  pull_request:
-    branches:
-      - Alpha
 concurrency:
   group: "${{ github.workflow }}-${{ github.ref }}"
   cancel-in-progress: true
@@ -192,15 +186,21 @@ jobs:
 
     - name: Set variables
       run: |
-        VERSION="${GITHUB_REF_NAME,,}-smart-$(git rev-parse --short HEAD)"
-        VERSION="${VERSION//\//-}"
-        PackageVersion="$(curl -s "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest" | jq -r '.tag_name' | sed 's/v//g' | awk -F '.' '{$NF = $NF + 1; print}' OFS='.').${VERSION/-/.}"
+        # Версия берётся из тега, а не из чужих релизов: апстримный вариант дёргал
+        # api.github.com/repos/MetaCubeX/mihomo/releases/latest и нумеровал наши сборки
+        # от версий MetaCubeX. Наш тег — единственный источник правды.
         if [ -n "${{ github.event.inputs.version }}" ]; then
-          VERSION=${{ github.event.inputs.version }}
-          PackageVersion="${VERSION#v}"
+          VERSION="${{ github.event.inputs.version }}"
+        elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+          VERSION="${GITHUB_REF_NAME}"
+        else
+          VERSION="${GITHUB_REF_NAME,,}-$(git rev-parse --short HEAD)"
         fi
+        VERSION="${VERSION//\//-}"
+        # PackageVersion уходит в имена deb/rpm, где префикс `v` недопустим.
+        PackageVersion="${VERSION#v}"
         echo "VERSION=${VERSION}" >> $GITHUB_ENV
-        echo "PackageVersion=${PackageVersion}-smart" >> $GITHUB_ENV
+        echo "PackageVersion=${PackageVersion}" >> $GITHUB_ENV
       
         echo "BUILDTIME=$(date)" >> $GITHUB_ENV
         echo "CGO_ENABLED=0" >> $GITHUB_ENV
@@ -396,41 +396,35 @@ jobs:
         generate_release_notes: true
         body_path: release.txt
 
+  # Публикация релиза. Основной путь — пуш тега `v*`; workflow_dispatch оставлен
+  # как запасной. Апстримная схема с двумя ветками (Alpha → force-push в Meta,
+  # тег на Alpha) выпилена: у нас одна ветка main, и тег ставится руками до сборки,
+  # так что джобе остаётся только собрать заметки и выложить артефакты.
   Upload-Release:
     permissions: write-all
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version != '' }}
+    if: ${{ github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && github.event.inputs.version != '') }}
     needs: [build]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          ref: Meta
           fetch-depth: '0'
           fetch-tags: 'true'
 
       - name: Get tags
         run: |
-          echo "CURRENTVERSION=${{ github.event.inputs.version }}" >> $GITHUB_ENV
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            CURRENTVERSION="${{ github.event.inputs.version }}"
+          else
+            CURRENTVERSION="${GITHUB_REF_NAME}"
+          fi
+          echo "CURRENTVERSION=${CURRENTVERSION}" >> $GITHUB_ENV
           git fetch --tags
-          echo "PREVERSION=$(git describe --tags --abbrev=0 HEAD)" >> $GITHUB_ENV
-
-      - name: Force push Alpha branch to Meta
-        run: |
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "github-actions[bot]"
-          git fetch origin Alpha:Alpha
-          git push origin Alpha:Meta --force
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Tag the commit on Alpha
-        run: |
-          git checkout Alpha 
-          git tag ${{ github.event.inputs.version }}
-          git push origin ${{ github.event.inputs.version }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Предыдущий тег для диапазона заметок; на самом первом релизе его нет —
+          # тогда берём первый коммит, иначе genReleaseNote.sh упадёт.
+          PREVERSION="$(git describe --tags --abbrev=0 "${CURRENTVERSION}^" 2>/dev/null || git rev-list --max-parents=0 HEAD | tail -1)"
+          echo "PREVERSION=${PREVERSION}" >> $GITHUB_ENV
 
       - name: Generate release notes
         run: |
@@ -451,12 +445,15 @@ jobs:
         uses: softprops/action-gh-release@v3
         if: ${{ success() }}
         with:
-          tag_name: ${{ github.event.inputs.version }}
+          tag_name: ${{ env.CURRENTVERSION }}
           files: bin/*
           body_path: release.md
 
+  # Docker-образ ядра нам не нужен (клиент тянет ядро как Go-модуль), а красная
+  # джоба в каждом релизе только мешает. Включается переменной репозитория
+  # ENABLE_DOCKER=true (Settings → Secrets and variables → Actions → Variables).
   Docker:
-    if: ${{ !startsWith(github.event_name, 'pull_request') }}
+    if: ${{ vars.ENABLE_DOCKER == 'true' && !startsWith(github.event_name, 'pull_request') }}
     permissions: write-all
     needs: [build]
     runs-on: ubuntu-latest
