@@ -9,6 +9,7 @@ on:
       - "docs/**"
       - "README.md"
       - "AGENTS.md"
+      - "CLAUDE.md"
       - ".github/ISSUE_TEMPLATE/**"
     branches:
       - main
