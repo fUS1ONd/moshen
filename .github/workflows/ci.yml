@@ -1,0 +1,48 @@
+# Повседневная проверка: одна ОС, одна версия Go, ~2-3 минуты.
+# Задача — быстрый красный/зелёный на каждый пуш и PR.
+# Полная матрица совместимости (42 джобы) лежит в test.yml и запускается вручную.
+name: CI
+
+on:
+  push:
+    paths-ignore:
+      - "docs/**"
+      - "README.md"
+      - "AGENTS.md"
+      - ".github/ISSUE_TEMPLATE/**"
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: 0
+      # Тесты взаимодействия с внешними inbound'ами требуют сети и флапают —
+      # в быстрой проверке они не нужны.
+      SKIP_INTEROP_TEST: 1
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          check-latest: true
+
+      - name: Build
+        run: go build -tags with_gvisor ./...
+
+      - name: Vet
+        run: go vet -tags with_gvisor ./...
+
+      - name: Test
+        run: go test ./... -count=1 -tags with_gvisor
