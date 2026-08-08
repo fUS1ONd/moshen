@@ -247,6 +247,19 @@ type forceHealthChecker interface {
 	ForceHealthCheck()
 }
 
+// groupHealthChecker — группа прокси: отдаёт залпу свои провайдеры и умеет
+// сбросить счётчик неудач. Объявлен здесь, у потребителя, по той же причине:
+// расширять публичные интерфейсы адаптеров ради двух методов не нужно, а type
+// assertion оставляет чужие реализации рабочими.
+//
+// Провайдеры группы форсит сам залп, а не группа: только у залпа есть полная
+// картина, и только он может не форсить один и тот же провайдер по разу на
+// каждую ссылающуюся группу.
+type groupHealthChecker interface {
+	HealthCheckProviders() []P.ProxyProvider
+	ResetFailedState()
+}
+
 // Тайминги форс-чека. Подобраны на стенде со сменой сети на LTE-модеме и
 // намеренно не выносятся в конфиг: фича работает из коробки, без рубильников.
 const (
@@ -330,12 +343,16 @@ func ForceHealthCheckAll() {
 // trigger — реакция на один входной сигнал смены сети: залп сразу и второй
 // залп по готовности нового пути.
 func (fc *forceChecker) trigger() {
-	gen := fc.gen.Add(1)
-	if fc.acceptTrigger() {
-		fc.fireVolley()
+	if !fc.acceptTrigger() {
+		// Сигнал схлопнут дебаунсом. Своего поколения он не заводит: поколение
+		// отменяет недоигранный гейт предыдущего, и при флапе на границе
+		// покрытия пачка подавленных сигналов сносила бы гейт за гейтом — второй
+		// залп, ради которого гейт и существует, не случался бы ни разу.
+		// Реакция уже идёт, её гейт даст второй залп за всю пачку.
+		return
 	}
-	// Гейт запускается и на подавленном дебаунсом сигнале: сеть-то сменилась,
-	// и второй залп по готовности нужен ровно так же.
+	gen := fc.gen.Add(1)
+	fc.fireVolley()
 	go fc.awaitReadiness(gen)
 }
 
@@ -363,13 +380,34 @@ func (fc *forceChecker) fireVolley() {
 	currentProxies := proxies
 	configMux.RUnlock()
 
-	for _, provider := range currentProviders {
-		provider := provider
+	// Один и тот же провайдер виден и в общей карте, и через каждую группу с
+	// use:. Форсим по идентичности ровно один раз: иначе залп множился бы на
+	// число групп и вместо ускорения давал шторм проб по всем нодам подписки.
+	seen := make(map[P.ProxyProvider]struct{}, len(currentProviders))
+	forceOnce := func(provider P.ProxyProvider) {
+		if provider == nil {
+			return
+		}
+		if _, dup := seen[provider]; dup {
+			return
+		}
+		seen[provider] = struct{}{}
 		go forceProviderHealthCheck(provider)
 	}
+
+	for _, provider := range currentProviders {
+		forceOnce(provider)
+	}
 	for _, proxy := range currentProxies {
-		if group, ok := proxy.Adapter().(forceHealthChecker); ok {
-			go group.ForceHealthCheck()
+		group, ok := proxy.Adapter().(groupHealthChecker)
+		if !ok {
+			continue
+		}
+		group.ResetFailedState()
+		// Провайдер группы со списком proxies собственный, в общей карте его
+		// нет — его залп видит только отсюда.
+		for _, provider := range group.HealthCheckProviders() {
+			forceOnce(provider)
 		}
 	}
 }
@@ -427,34 +465,58 @@ func (fc *forceChecker) awaitReadiness(gen int64) {
 func (fc *forceChecker) probeAddrs() []string {
 	configMux.RLock()
 	currentProxies := proxies
+	currentProviders := providers
 	configMux.RUnlock()
+
+	seen := make(map[string]struct{}, fc.probeLimit)
+	addrs := make([]string, 0, fc.probeLimit)
+
+	// add возвращает false, когда потолок набран и обход пора прекращать.
+	add := func(proxy C.Proxy) bool {
+		if proxy == nil || !isLeafProxy(proxy) {
+			return true
+		}
+		addr := proxy.Addr()
+		if addr == "" {
+			return true
+		}
+		if _, dup := seen[addr]; dup {
+			return true
+		}
+		seen[addr] = struct{}{}
+		addrs = append(addrs, addr)
+		return len(addrs) < fc.probeLimit
+	}
 
 	names := make([]string, 0, len(currentProxies))
 	for name := range currentProxies {
 		names = append(names, name)
 	}
 	slices.Sort(names)
-
-	seen := make(map[string]struct{}, fc.probeLimit)
-	addrs := make([]string, 0, fc.probeLimit)
 	for _, name := range names {
-		proxy := currentProxies[name]
-		if !isLeafProxy(proxy) {
-			continue
-		}
-		addr := proxy.Addr()
-		if addr == "" {
-			continue
-		}
-		if _, dup := seen[addr]; dup {
-			continue
-		}
-		seen[addr] = struct{}{}
-		addrs = append(addrs, addr)
-		if len(addrs) >= fc.probeLimit {
-			break
+		if !add(currentProxies[name]) {
+			return addrs
 		}
 	}
+
+	// Ноды подписок в общей карте прокси не лежат: туда попадают только ноды из
+	// секции proxies, группы и служебные адаптеры. Без обхода провайдеров гейт
+	// готовности молчал бы на самом частом мобильном конфиге (proxy-providers +
+	// группы с use:) — дозваниваться было бы некуда, и второго залпа не было бы
+	// вовсе.
+	providerNames := make([]string, 0, len(currentProviders))
+	for name := range currentProviders {
+		providerNames = append(providerNames, name)
+	}
+	slices.Sort(providerNames)
+	for _, name := range providerNames {
+		for _, proxy := range currentProviders[name].Proxies() {
+			if !add(proxy) {
+				return addrs
+			}
+		}
+	}
+
 	return addrs
 }
 
@@ -466,9 +528,9 @@ func isLeafProxy(proxy C.Proxy) bool {
 	case C.Direct, C.Reject, C.RejectDrop, C.Compatible, C.Pass, C.PassRule, C.Rematch, C.Dns:
 		return false
 	}
-	// Группы опознаются по умению форс-чека, а не по списку типов: так новый тип
-	// группы у апстрима не придётся дописывать сюда руками.
-	_, isGroup := proxy.Adapter().(forceHealthChecker)
+	// Группы опознаются по интерфейсу группы, а не по списку типов: так новый
+	// тип группы у апстрима не придётся дописывать сюда руками.
+	_, isGroup := proxy.Adapter().(groupHealthChecker)
 	return !isGroup
 }
 
@@ -741,7 +803,7 @@ func handleUDPConn(packet C.PacketAdapter) {
 			logMetadata(metadata, rule, rawPc)
 
 			// recover info to dialMetadata for smart
-			dialMetadata.Host = metadata.Host 
+			dialMetadata.Host = metadata.Host
 			dialMetadata.SmartTarget = metadata.SmartTarget
 			dialMetadata.SmartBlock = metadata.SmartBlock
 
@@ -962,7 +1024,7 @@ func match(metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule, err
 					}
 				}
 
-				if ! smart {
+				if !smart {
 					metadata.SmartTarget = ""
 				} else {
 					metadata.SmartBlock = "normal"

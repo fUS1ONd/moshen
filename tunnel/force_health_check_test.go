@@ -18,18 +18,20 @@ import (
 
 // fakeProvider — провайдер, умеющий форс-чек и фиксирующий факты проверок.
 // Встроенный интерфейс оставлен nil намеренно: методов сверх проверки живости
-// залп не касается, а вызов любого другого сразу упадёт паникой и покажет, что
-// код полез не туда.
+// и выдачи нод залп не касается, а вызов любого другого сразу упадёт паникой и
+// покажет, что код полез не туда.
 type fakeProvider struct {
 	P.ProxyProvider
 	name    string
+	nodes   []C.Proxy
 	forced  atomic.Int32
 	checked atomic.Int32
 }
 
-func (p *fakeProvider) Name() string      { return p.name }
-func (p *fakeProvider) HealthCheck()      { p.checked.Add(1) }
-func (p *fakeProvider) ForceHealthCheck() { p.forced.Add(1) }
+func (p *fakeProvider) Name() string       { return p.name }
+func (p *fakeProvider) Proxies() []C.Proxy { return p.nodes }
+func (p *fakeProvider) HealthCheck()       { p.checked.Add(1) }
+func (p *fakeProvider) ForceHealthCheck()  { p.forced.Add(1) }
 
 // plainProvider — провайдер без поддержки форс-чека: чужая реализация
 // P.ProxyProvider, которая ничего не знает про смену сети.
@@ -38,18 +40,24 @@ type plainProvider struct {
 	checked atomic.Int32
 }
 
-func (p *plainProvider) HealthCheck() { p.checked.Add(1) }
+func (p *plainProvider) Proxies() []C.Proxy { return nil }
+func (p *plainProvider) HealthCheck()       { p.checked.Add(1) }
 
-// fakeGroupAdapter — адаптер группы: умеет форс-чек и считает вызовы.
+// fakeGroupAdapter — адаптер группы: отдаёт свои провайдеры залпу и считает
+// сбросы счётчика неудач.
 type fakeGroupAdapter struct {
 	C.ProxyAdapter
-	name   string
-	forced atomic.Int32
+	name      string
+	providers []P.ProxyProvider
+	reset     atomic.Int32
 }
 
-func (g *fakeGroupAdapter) Name() string                     { return g.name }
-func (g *fakeGroupAdapter) Type() C.AdapterType              { return C.Fallback }
-func (g *fakeGroupAdapter) ForceHealthCheck()                { g.forced.Add(1) }
+func (g *fakeGroupAdapter) Name() string        { return g.name }
+func (g *fakeGroupAdapter) Type() C.AdapterType { return C.Fallback }
+func (g *fakeGroupAdapter) HealthCheckProviders() []P.ProxyProvider {
+	return g.providers
+}
+func (g *fakeGroupAdapter) ResetFailedState()                { g.reset.Add(1) }
 func (g *fakeGroupAdapter) Addr() string                     { return "" }
 func (g *fakeGroupAdapter) SupportUDP() bool                 { return false }
 func (g *fakeGroupAdapter) SupportUOT() bool                 { return false }
@@ -68,8 +76,7 @@ func (p *fakeProxy) Addr() string            { return p.addr }
 func (p *fakeProxy) Type() C.AdapterType     { return p.typ }
 func (p *fakeProxy) Name() string            { return p.adapter.Name() }
 
-// leafAdapter — обычная нода: собственный адрес, форс-чек не поддерживает
-// (её проверяет провайдер, а не она сама).
+// leafAdapter — обычная нода: собственный адрес, группой не является.
 type leafAdapter struct {
 	C.ProxyAdapter
 	name string
@@ -78,6 +85,10 @@ type leafAdapter struct {
 
 func (a *leafAdapter) Name() string { return a.name }
 func (a *leafAdapter) Addr() string { return a.addr }
+
+func leafProxy(name, addr string) *fakeProxy {
+	return &fakeProxy{adapter: &leafAdapter{name: name, addr: addr}, typ: C.Vless, addr: addr}
+}
 
 // setTunnelState подменяет карты прокси и провайдеров на время теста.
 func setTunnelState(t *testing.T, newProxies map[string]C.Proxy, newProviders map[string]P.ProxyProvider) {
@@ -125,10 +136,44 @@ func TestForceHealthCheckAllProbesProvidersAndGroups(t *testing.T) {
 	ForceHealthCheckAll()
 
 	waitFor(t, func() bool { return provider.forced.Load() == 1 }, "форс-чек провайдера")
-	waitFor(t, func() bool { return group.forced.Load() == 1 }, "форс-чек группы")
+	waitFor(t, func() bool { return group.reset.Load() == 1 }, "сброс счётчика неудач группы")
 
 	if got := provider.checked.Load(); got != 0 {
 		t.Fatalf("провайдер проверен штатным путём %d раз, ожидался только форс-чек", got)
+	}
+}
+
+// Провайдер, на который ссылаются сразу несколько групп, форсится один раз, а
+// не по разу на группу: иначе залп превращается в шторм проб по всем нодам.
+func TestForceHealthCheckAllForcesSharedProviderOnce(t *testing.T) {
+	shared := &fakeProvider{name: "shared"}
+	own := &fakeProvider{name: "own"}
+	groupA := &fakeGroupAdapter{name: "a", providers: []P.ProxyProvider{shared}}
+	groupB := &fakeGroupAdapter{name: "b", providers: []P.ProxyProvider{shared}}
+	// groupC живёт на собственном compatible-провайдере: в общей карте его нет,
+	// и увидеть его залп может только через саму группу.
+	groupC := &fakeGroupAdapter{name: "c", providers: []P.ProxyProvider{own}}
+
+	setTunnelState(t,
+		map[string]C.Proxy{
+			"a": &fakeProxy{adapter: groupA, typ: C.Fallback},
+			"b": &fakeProxy{adapter: groupB, typ: C.Fallback},
+			"c": &fakeProxy{adapter: groupC, typ: C.Fallback},
+		},
+		map[string]P.ProxyProvider{"shared": shared},
+	)
+
+	ForceHealthCheckAll()
+
+	waitFor(t, func() bool { return shared.forced.Load() >= 1 }, "форс-чек общего провайдера")
+	waitFor(t, func() bool { return own.forced.Load() >= 1 }, "форс-чек собственного провайдера группы")
+	time.Sleep(50 * time.Millisecond)
+
+	if got := shared.forced.Load(); got != 1 {
+		t.Fatalf("общий провайдер форсили %d раз, ожидался ровно один", got)
+	}
+	if got := own.forced.Load(); got != 1 {
+		t.Fatalf("собственный провайдер группы форсили %d раз, ожидался ровно один", got)
 	}
 }
 
@@ -163,12 +208,6 @@ func (d *fakeDialer) dial(ctx context.Context, network, address string) (net.Con
 	return client, nil
 }
 
-func (d *fakeDialer) setReachable(reachable bool) {
-	d.mu.Lock()
-	d.reachable = reachable
-	d.mu.Unlock()
-}
-
 func (d *fakeDialer) probed() []string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -191,9 +230,7 @@ func gateChecker(dial *fakeDialer) *forceChecker {
 func TestReadinessGateFiresSecondVolleyOnFirstReachableProbe(t *testing.T) {
 	provider := &fakeProvider{name: "provider"}
 	setTunnelState(t,
-		map[string]C.Proxy{
-			"node": &fakeProxy{adapter: &leafAdapter{name: "node", addr: "example.com:443"}, typ: C.Vless, addr: "example.com:443"},
-		},
+		map[string]C.Proxy{"node": leafProxy("node", "example.com:443")},
 		map[string]P.ProxyProvider{"provider": provider},
 	)
 
@@ -213,9 +250,7 @@ func TestReadinessGateFiresSecondVolleyOnFirstReachableProbe(t *testing.T) {
 func TestReadinessGateFiresSecondVolleyOnTimeout(t *testing.T) {
 	provider := &fakeProvider{name: "provider"}
 	setTunnelState(t,
-		map[string]C.Proxy{
-			"node": &fakeProxy{adapter: &leafAdapter{name: "node", addr: "example.com:443"}, typ: C.Vless, addr: "example.com:443"},
-		},
+		map[string]C.Proxy{"node": leafProxy("node", "example.com:443")},
 		map[string]P.ProxyProvider{"provider": provider},
 	)
 
@@ -231,30 +266,55 @@ func TestReadinessGateFiresSecondVolleyOnTimeout(t *testing.T) {
 	}
 }
 
+// Ноды подписки лежат только в провайдере, в общей карте прокси их нет. Гейт
+// обязан дозваниваться и до них — иначе на subscription-конфиге второго залпа
+// не будет вовсе.
+func TestReadinessGateProbesProviderNodes(t *testing.T) {
+	provider := &fakeProvider{
+		name:  "sub",
+		nodes: []C.Proxy{leafProxy("sub-1", "sub1.example:443")},
+	}
+	group := &fakeGroupAdapter{name: "group", providers: []P.ProxyProvider{provider}}
+	setTunnelState(t,
+		map[string]C.Proxy{"group": &fakeProxy{adapter: group, typ: C.Fallback}},
+		map[string]P.ProxyProvider{"sub": provider},
+	)
+
+	dial := &fakeDialer{reachable: true}
+	checker := gateChecker(dial)
+	checker.trigger()
+
+	waitFor(t, func() bool { return provider.forced.Load() == 2 }, "второй залп по нодам провайдера")
+
+	probed := dial.probed()
+	if len(probed) == 0 || probed[0] != "sub1.example:443" {
+		t.Fatalf("гейт дозванивался до %v, ожидался адрес ноды из провайдера", probed)
+	}
+}
+
 // Повторная смена сети отменяет недоигранную реакцию на предыдущую.
 func TestReadinessGateCancelledByNewerGeneration(t *testing.T) {
 	provider := &fakeProvider{name: "provider"}
 	setTunnelState(t,
-		map[string]C.Proxy{
-			"node": &fakeProxy{adapter: &leafAdapter{name: "node", addr: "example.com:443"}, typ: C.Vless, addr: "example.com:443"},
-		},
+		map[string]C.Proxy{"node": leafProxy("node", "example.com:443")},
 		map[string]P.ProxyProvider{"provider": provider},
 	)
 
 	dial := &fakeDialer{reachable: false}
 	checker := gateChecker(dial)
+	// Дебаунс ужат: нужен именно второй принятый сигнал, а не подавленный.
+	checker.debounce = 10 * time.Millisecond
 
-	// Два сигнала подряд: второй схлопывается дебаунсом, но своё поколение
-	// заводит — и гейт первого обязан замолчать.
 	checker.trigger()
-	time.Sleep(checker.interval)
+	time.Sleep(3 * checker.interval)
 	checker.trigger()
 
-	waitFor(t, func() bool { return provider.forced.Load() == 2 }, "залп гейта последнего поколения")
+	// Два немедленных залпа плюс один гейтовый — от последнего поколения.
+	waitFor(t, func() bool { return provider.forced.Load() == 3 }, "залп гейта последнего поколения")
 	time.Sleep(2 * checker.timeout)
 
-	if got := provider.forced.Load(); got != 2 {
-		t.Fatalf("залпов: %d, ожидалось 2 (немедленный и один гейтовый) — гейт отменённого поколения выстрелил", got)
+	if got := provider.forced.Load(); got != 3 {
+		t.Fatalf("залпов: %d, ожидалось 3 (два немедленных и один гейтовый) — гейт отменённого поколения выстрелил", got)
 	}
 }
 
@@ -267,8 +327,8 @@ func TestReadinessGateProbesOnlyLeafProxies(t *testing.T) {
 			"reject":  &fakeProxy{adapter: &leafAdapter{name: "reject", addr: ""}, typ: C.Reject},
 			"group":   &fakeProxy{adapter: &fakeGroupAdapter{name: "group"}, typ: C.Fallback},
 			"noaddr":  &fakeProxy{adapter: &leafAdapter{name: "noaddr", addr: ""}, typ: C.Vless},
-			"node":    &fakeProxy{adapter: &leafAdapter{name: "node", addr: "example.com:443"}, typ: C.Vless, addr: "example.com:443"},
-			"nodedup": &fakeProxy{adapter: &leafAdapter{name: "nodedup", addr: "example.com:443"}, typ: C.Vless, addr: "example.com:443"},
+			"node":    leafProxy("node", "example.com:443"),
+			"nodedup": leafProxy("nodedup", "example.com:443"),
 		},
 		map[string]P.ProxyProvider{},
 	)
