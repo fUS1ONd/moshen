@@ -63,6 +63,17 @@ func (s *Single[T]) Reset() {
 	s.mux.Unlock()
 }
 
+// ResetResult сбрасывает только окно кэширования, не трогая идущий вызов.
+// В отличие от Reset, конкурентные вызовы Do после него присоединяются к уже
+// идущему, а не запускают каждый свой: Reset обнуляет s.call, и тогда каждый
+// сбрасывающий становится новым «первым», а результат идущего вызова
+// выбрасывается и даже не кэшируется.
+func (s *Single[T]) ResetResult() {
+	s.mux.Lock()
+	s.result = nil
+	s.mux.Unlock()
+}
+
 func NewSingle[T any](wait time.Duration) *Single[T] {
 	return &Single[T]{wait: wait}
 }
