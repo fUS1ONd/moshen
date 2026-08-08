@@ -320,6 +320,44 @@ func (gb *GroupBase) healthCheck() {
 	gb.failedTimes = 0
 }
 
+// forceHealthChecker — провайдер, умеющий проверку в обход окна дедупликации
+// (adapter/provider.baseProvider). Объявлен здесь, у потребителя.
+type forceHealthChecker interface {
+	ForceHealthCheck()
+}
+
+// ForceHealthCheck проверяет всех членов группы немедленно, вне расписания и в
+// обход окна дедупликации провайдеров. Вызывается при смене сети из
+// tunnel.ForceHealthCheckAll — напрямую, потому что у группы со списком proxies
+// провайдер собственный и в общей карте провайдеров его нет.
+//
+// В отличие от healthCheck, не выходит по failedTesting: идущая проверка могла
+// начаться ещё через прежний сетевой путь, и дожидаться её результата — значит
+// потерять ровно те секунды, ради которых всё это делается.
+func (gb *GroupBase) ForceHealthCheck() {
+	// Счётчик неудач набран на прежней сети и к новой отношения не имеет.
+	gb.failedTimes = 0
+
+	gb.failedTesting.Store(true)
+	wg := sync.WaitGroup{}
+	for _, proxyProvider := range gb.providers {
+		wg.Add(1)
+		proxyProvider := proxyProvider
+		go func() {
+			defer wg.Done()
+			if forceable, ok := proxyProvider.(forceHealthChecker); ok {
+				forceable.ForceHealthCheck()
+				return
+			}
+			proxyProvider.HealthCheck()
+		}()
+	}
+
+	wg.Wait()
+	gb.failedTesting.Store(false)
+	gb.failedTimes = 0
+}
+
 func (gb *GroupBase) onDialSuccess() {
 	if !gb.failedTesting.Load() {
 		gb.failedTimes = 0

@@ -16,6 +16,7 @@ import (
 	"github.com/metacubex/mihomo/common/atomic"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
+	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/loopback"
 	"github.com/metacubex/mihomo/component/nat"
 	"github.com/metacubex/mihomo/component/process"
@@ -235,6 +236,266 @@ func UpdateProxies(newProxies map[string]C.Proxy, newProviders map[string]P.Prox
 	proxies = newProxies
 	providers = newProviders
 	configMux.Unlock()
+}
+
+// forceHealthChecker — провайдер или группа, умеющие проверить живость немедленно,
+// вне штатного расписания и в обход окна дедупликации. Интерфейс объявлен здесь,
+// у потребителя: расширять ради одного метода публичный P.ProxyProvider не нужно,
+// а type assertion оставляет чужие реализации рабочими (они получат штатную
+// проверку вместо форсированной).
+type forceHealthChecker interface {
+	ForceHealthCheck()
+}
+
+// Тайминги форс-чека. Подобраны на стенде со сменой сети на LTE-модеме и
+// намеренно не выносятся в конфиг: фича работает из коробки, без рубильников.
+const (
+	// Окно схлопывания входных сигналов. На границе покрытия Wi-Fi сеть флапает
+	// и сигналы приходят пачкой; без дебаунса каждый стоил бы залпа проб по всем
+	// нодам. Реактивность не страдает: подавленный сигнал догонит вторым залпом,
+	// который даёт гейт готовности.
+	forceCheckDebounce = time.Second
+
+	// Потолок ожидания готовности пути. За три секунды новый путь либо поднялся,
+	// либо сети нет вовсе — дальше ждать нечего, второй залп идёт безусловно.
+	readinessTimeout = 3 * time.Second
+
+	// Пауза между попытками дозвона. Реже — теряем секунды на ровном месте,
+	// чаще — жжём батарею и мобильный канал.
+	readinessInterval = 250 * time.Millisecond
+
+	// Таймаут одного дозвона: с запасом к RTT мобильной сети, но заметно меньше
+	// потолка, чтобы за него уместилось несколько попыток.
+	readinessDialTimeout = 500 * time.Millisecond
+
+	// Сколько адресов опрашивает гейт. В конфиге бывают сотни нод, и дозвон до
+	// каждой каждые 250 мс — это шторм. Гейту хватает горсти: он выясняет не
+	// «жива ли конкретная нода», а «проходит ли через новый путь вообще TCP».
+	readinessProbeLimit = 8
+)
+
+// forceChecker — механика форс-чека: дебаунс входных сигналов, залп проверок,
+// гейт готовности и поколения. Отдельным типом, а не набором пакетных
+// переменных, чтобы тесты могли собрать свой экземпляр с ужатыми таймингами и
+// фейковым дозвоном, не трогая рабочий.
+type forceChecker struct {
+	debounce    time.Duration
+	timeout     time.Duration
+	interval    time.Duration
+	dialTimeout time.Duration
+	probeLimit  int
+
+	// dial — дозвон гейта готовности. По умолчанию component/dialer: он
+	// привязывает сокет к физическому интерфейсу, поэтому проба не заворачивается
+	// в наш же туннель. Голый net.Dial при включённом auto-route дал бы ложный
+	// успех через себя же — гейт открывался бы, не дождавшись реальной сети.
+	dial func(ctx context.Context, network, address string) (net.Conn, error)
+
+	// gen — поколение форс-чека. Свежий сигнал инкрементирует счётчик и тем
+	// самым отменяет незавершённый гейт предыдущего: одновременно живёт только
+	// реакция последнего поколения, эффекты не накладываются.
+	gen atomic.Int64
+
+	mu          sync.Mutex
+	lastTrigger time.Time
+}
+
+// defaultForceChecker обслуживает публичный ForceHealthCheckAll.
+var defaultForceChecker = &forceChecker{
+	debounce:    forceCheckDebounce,
+	timeout:     readinessTimeout,
+	interval:    readinessInterval,
+	dialTimeout: readinessDialTimeout,
+	probeLimit:  readinessProbeLimit,
+	dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+		return dialer.DialContext(ctx, network, address)
+	},
+}
+
+// ForceHealthCheckAll — немедленная проверка живости всех прокси и групп.
+// Единственный публичный вход быстрого переключения: его дёргают монитор
+// дефолтного интерфейса (десктоп, TUN) и Android-клиент при смене сети,
+// поднятии туннеля и включении экрана.
+//
+// Зачем: alive-состояния прокси остаются от прежнего сетевого пути, и до
+// очередного тика health-check (в конфигах пользователей это десятки секунд)
+// ядро льёт трафик в заведомо мёртвый путь.
+//
+// Вызов не блокирует вызывающего: приходит из системного callback'а, держать
+// его на время проб нельзя.
+func ForceHealthCheckAll() {
+	defaultForceChecker.trigger()
+}
+
+// trigger — реакция на один входной сигнал смены сети: залп сразу и второй
+// залп по готовности нового пути.
+func (fc *forceChecker) trigger() {
+	gen := fc.gen.Add(1)
+	if fc.acceptTrigger() {
+		fc.fireVolley()
+	}
+	// Гейт запускается и на подавленном дебаунсом сигнале: сеть-то сменилась,
+	// и второй залп по готовности нужен ровно так же.
+	go fc.awaitReadiness(gen)
+}
+
+// acceptTrigger — дебаунс входных сигналов: пачка событий флапа схлопывается в
+// один залп. Считается по сигналам, а не по залпам, — залпы бывают и полезные
+// (второй залп за гейтом готовности), глушить их дебаунсом нельзя.
+func (fc *forceChecker) acceptTrigger() bool {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+
+	now := time.Now()
+	if !fc.lastTrigger.IsZero() && now.Sub(fc.lastTrigger) < fc.debounce {
+		return false
+	}
+	fc.lastTrigger = now
+	return true
+}
+
+// fireVolley — залп: проверка живости всех провайдеров и групп разом, каждая
+// цель в своей горутине. Группы проверяются отдельно от провайдеров, потому что
+// у группы со списком proxies провайдер собственный, в общей карте его нет.
+func (fc *forceChecker) fireVolley() {
+	configMux.RLock()
+	currentProviders := providers
+	currentProxies := proxies
+	configMux.RUnlock()
+
+	for _, provider := range currentProviders {
+		provider := provider
+		go forceProviderHealthCheck(provider)
+	}
+	for _, proxy := range currentProxies {
+		if group, ok := proxy.Adapter().(forceHealthChecker); ok {
+			go group.ForceHealthCheck()
+		}
+	}
+}
+
+// forceProviderHealthCheck — проверка провайдера в обход окна дедупликации, если
+// он это умеет. Иначе штатная: проверить с дедупликацией лучше, чем не проверить.
+func forceProviderHealthCheck(provider P.ProxyProvider) {
+	if forceable, ok := provider.(forceHealthChecker); ok {
+		forceable.ForceHealthCheck()
+		return
+	}
+	provider.HealthCheck()
+}
+
+// awaitReadiness ждёт, пока новый сетевой путь начнёт пропускать трафик, и даёт
+// второй залп.
+//
+// Зачем второй залп: первый уходит в момент, когда система уже сообщила о смене
+// сети, а новый путь ещё поднимается. Пробы по нему не доходят, живые ноды
+// получают ложное «мёртв» — и группа откатывается на заведомо дохлый вариант
+// ровно тогда, когда связь наконец появилась. Залп по прогретому пути это
+// исправляет.
+//
+// Готовность — первый успешный TCP-дозвон до любого из серверов нод. Не
+// дождались за потолок — стреляем безусловно: если сети действительно нет, все
+// ноды честно останутся мёртвыми, хуже не будет.
+func (fc *forceChecker) awaitReadiness(gen int64) {
+	addrs := fc.probeAddrs()
+	if len(addrs) == 0 {
+		return // дозваниваться некуда, второй залп ничего не уточнит
+	}
+
+	deadline := time.Now().Add(fc.timeout)
+	for {
+		if fc.gen.Load() != gen {
+			return // сеть сменилась снова, гейтом занимается новое поколение
+		}
+		if fc.anyReachable(addrs) || !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(fc.interval)
+	}
+
+	if fc.gen.Load() != gen {
+		return
+	}
+	fc.fireVolley()
+}
+
+// probeAddrs — адреса для гейта: server:port листовых нод.
+//
+// Список сортируется и режется по потолку. Сортировка не косметика: обход карты
+// в Go случаен, и без неё каждый вызов гейта опрашивал бы свою случайную горсть
+// адресов — поведение фичи стало бы лотереей, невоспроизводимой на стенде.
+func (fc *forceChecker) probeAddrs() []string {
+	configMux.RLock()
+	currentProxies := proxies
+	configMux.RUnlock()
+
+	names := make([]string, 0, len(currentProxies))
+	for name := range currentProxies {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+
+	seen := make(map[string]struct{}, fc.probeLimit)
+	addrs := make([]string, 0, fc.probeLimit)
+	for _, name := range names {
+		proxy := currentProxies[name]
+		if !isLeafProxy(proxy) {
+			continue
+		}
+		addr := proxy.Addr()
+		if addr == "" {
+			continue
+		}
+		if _, dup := seen[addr]; dup {
+			continue
+		}
+		seen[addr] = struct{}{}
+		addrs = append(addrs, addr)
+		if len(addrs) >= fc.probeLimit {
+			break
+		}
+	}
+	return addrs
+}
+
+// isLeafProxy — прокси с собственным сетевым адресом: не группа и не служебный
+// адаптер. У групп адреса нет, служебные (DIRECT, REJECT и прочие) до серверов
+// нод не ходят — гейту и те и другие бесполезны.
+func isLeafProxy(proxy C.Proxy) bool {
+	switch proxy.Type() {
+	case C.Direct, C.Reject, C.RejectDrop, C.Compatible, C.Pass, C.PassRule, C.Rematch, C.Dns:
+		return false
+	}
+	// Группы опознаются по умению форс-чека, а не по списку типов: так новый тип
+	// группы у апстрима не придётся дописывать сюда руками.
+	_, isGroup := proxy.Adapter().(forceHealthChecker)
+	return !isGroup
+}
+
+// anyReachable — дозвон до всех адресов разом, true по первому успеху. Ждать
+// остальных незачем: гейт спрашивает «путь ожил?», а не «сколько нод живо».
+func (fc *forceChecker) anyReachable(addrs []string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), fc.dialTimeout)
+	defer cancel()
+
+	results := make(chan bool, len(addrs))
+	for _, addr := range addrs {
+		addr := addr
+		go func() {
+			conn, err := fc.dial(ctx, "tcp", addr)
+			if err == nil {
+				_ = conn.Close()
+			}
+			results <- err == nil
+		}()
+	}
+
+	for range addrs {
+		if <-results {
+			return true // остальные дозвоны свернёт cancel
+		}
+	}
+	return false
 }
 
 func UpdateListeners(newListeners map[string]C.InboundListener) {

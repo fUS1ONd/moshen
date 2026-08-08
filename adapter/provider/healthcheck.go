@@ -120,6 +120,14 @@ func (hc *HealthCheck) touch() {
 	hc.lastTouch.Store(time.Now())
 }
 
+// forceCheck сбрасывает окно дедупликации singleDo и проверяет немедленно.
+// Нужен при смене сети: обычный check() в пределах окна вернёт закэшированный
+// результат — тот, что получен ещё через прежний сетевой путь.
+func (hc *HealthCheck) forceCheck() {
+	hc.singleDo.Reset()
+	hc.check()
+}
+
 func (hc *HealthCheck) check() {
 	if len(hc.proxies) == 0 {
 		return
