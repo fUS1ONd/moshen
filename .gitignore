@@ -26,3 +26,6 @@ test/config/cache*
 /output
 .vscode/
 .fleet/
+
+# Эфемерные спеки и тикеты агентских скиллов
+.scratch/

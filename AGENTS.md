@@ -114,6 +114,24 @@ replace github.com/metacubex/mihomo => github.com/fUS1ONd/moshen <тег>
 2. в клиенте запустить workflow `Update Moshen Core and Go Modules` — он сам
    поправит `replace` в обоих `go.mod`, прогонит `go mod tidy` и откроет PR.
 
+## Agent skills
+
+Репозиторий настроен под инженерные скиллы (`/setup-matt-pocock-skills`).
+
+### Issue tracker
+
+Задачи и спеки живут локальными markdown-файлами в `.scratch/<feature>/` — ни GitHub Issues,
+ни внешний трекер не используются. См. `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Пять канонических ролей без переименований (`needs-triage`, `needs-info`, `ready-for-agent`,
+`ready-for-human`, `wontfix`). См. `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` и `docs/adr/` в корне репозитория. См. `docs/agents/domain.md`.
+
 ## История
 
 Первая реализация быстрого переключения при смене сети (прототип, вайбкод)
