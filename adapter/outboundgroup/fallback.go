@@ -6,6 +6,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/callback"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
@@ -21,6 +22,10 @@ type Fallback struct {
 	testUrl        string
 	selected       string
 	expectedStatus string
+	// lastAlive — имя последнего участника, прошедшего проверку живости.
+	// Атомарное: выбор участника идёт из нескольких горутин сразу (каждое
+	// соединение дёргает findAliveProxy).
+	lastAlive atomic.TypedValue[string]
 }
 
 func (f *Fallback) Now() string {
@@ -107,15 +112,30 @@ func (f *Fallback) findAliveProxy(touch bool) C.Proxy {
 	for _, proxy := range proxies {
 		if len(f.selected) == 0 {
 			if proxy.AliveForTestUrl(f.testUrl) {
+				f.lastAlive.Store(proxy.Name())
 				return proxy
 			}
 		} else {
 			if proxy.Name() == f.selected {
 				if proxy.AliveForTestUrl(f.testUrl) {
+					f.lastAlive.Store(proxy.Name())
 					return proxy
 				} else {
 					f.selected = ""
 				}
+			}
+		}
+	}
+
+	// Живых участников нет. Штатный откат к первому по списку отправляет группу
+	// на вариант, который в такой момент обычно и есть самый мёртвый (первым в
+	// списке стоит основная нода, а сеть только что сменилась). Дальше группа
+	// флаппингует между ним и оживающими участниками. Держимся за последний
+	// работавший: он с большей вероятностью оживёт первым.
+	if name := f.lastAlive.Load(); name != "" {
+		for _, proxy := range proxies {
+			if proxy.Name() == name {
+				return proxy
 			}
 		}
 	}

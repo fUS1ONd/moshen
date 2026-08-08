@@ -116,7 +116,16 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	initInnerTcp()
 	loadProvider(cfg.Providers)
 	updateProfile(cfg)
-	loadProvider(cfg.RuleProviders)
+	// Rule-провайдеры догружаются в фоне: старт ядра их не ждёт. На мобильной
+	// сети списки правил тянутся через прокси-группу, которая в этот момент сама
+	// поднимается, и каждая неудачная попытка стоит таймаута — туннель
+	// оказывается готов на секунды позже. Цена: пока список не загружен, правило
+	// на нём не срабатывает и соединение уходит по следующему подходящему (в
+	// пределе — в MATCH). Подробнее: docs/adr/0001-neblokiruyushchaya-zagruzka-rule-providerov.md
+	//
+	// Прокси-провайдеров это не касается: без них группы пусты, и ядро,
+	// объявившее себя готовым, лило бы трафик в никуда.
+	go loadProvider(cfg.RuleProviders)
 	runtime.GC()
 	tunnel.OnRunning()
 	updateUpdater(cfg)
