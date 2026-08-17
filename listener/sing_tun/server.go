@@ -22,6 +22,7 @@ import (
 	LC "github.com/metacubex/mihomo/listener/config"
 	"github.com/metacubex/mihomo/listener/sing"
 	"github.com/metacubex/mihomo/log"
+	MT "github.com/metacubex/mihomo/tunnel"
 	"golang.org/x/exp/constraints"
 
 	tun "github.com/metacubex/sing-tun"
@@ -365,6 +366,14 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 			}
 			iface.FlushCache()
 			resolver.ResetConnection() // reset resolver's connection after default interface changed
+			if defaultInterface != nil {
+				// Путь сменился: alive-состояния прокси остались от прежнего
+				// интерфейса, и без принудительной проверки группа дожидалась бы
+				// очередного тика health-check. На потере интерфейса не стреляем —
+				// пробовать в этот момент некуда, реакция придёт на появлении
+				// нового пути.
+				MT.ForceHealthCheckAll()
+			}
 		})
 		err = defaultInterfaceMonitor.Start()
 		if err != nil {

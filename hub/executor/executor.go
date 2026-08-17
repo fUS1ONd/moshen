@@ -25,6 +25,7 @@ import (
 	"github.com/metacubex/mihomo/component/profile/cachefile"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/resource"
+	"github.com/metacubex/mihomo/component/smart/lightgbm"
 	"github.com/metacubex/mihomo/component/sniffer"
 	"github.com/metacubex/mihomo/component/trie"
 	"github.com/metacubex/mihomo/component/updater"
@@ -40,7 +41,6 @@ import (
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/ntp/ntp"
 	"github.com/metacubex/mihomo/tunnel"
-	"github.com/metacubex/mihomo/component/smart/lightgbm"
 )
 
 var mux sync.Mutex
@@ -116,6 +116,14 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	initInnerTcp()
 	loadProvider(cfg.Providers)
 	updateProfile(cfg)
+	// Rule-провайдеры грузятся синхронно, до OnRunning. Фоновая загрузка тут
+	// пробовалась и отменена: isHandle пропускает не-INNER трафик только со
+	// статуса Running, поэтому до неё пользовательский трафик просто ждал, а с
+	// ней — идёт по конфигу с пустыми RULE-SET'ами. Незагруженный список не
+	// матчится, соединение проваливается на следующее подходящее правило, и на
+	// типовом конфиге (RULE-SET,...,PROXY плюс MATCH,DIRECT) весь трафик первые
+	// секунды уходит мимо туннеля, в открытую. Это не «как раньше», это хуже.
+	// Подробнее: docs/adr/0001-neblokiruyushchaya-zagruzka-rule-providerov.md
 	loadProvider(cfg.RuleProviders)
 	runtime.GC()
 	tunnel.OnRunning()

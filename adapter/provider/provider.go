@@ -72,6 +72,12 @@ func (bp *baseProvider) HealthCheck() {
 	bp.healthCheck.check()
 }
 
+// ForceHealthCheck проверяет живость немедленно, минуя окно дедупликации.
+// Вызывается при смене сети из tunnel.ForceHealthCheckAll.
+func (bp *baseProvider) ForceHealthCheck() {
+	bp.healthCheck.forceCheck()
+}
+
 func (bp *baseProvider) Type() P.ProviderType {
 	return P.Proxy
 }

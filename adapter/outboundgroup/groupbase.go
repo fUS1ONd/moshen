@@ -28,7 +28,7 @@ type GroupBase struct {
 	excludeTypeArray  []string
 	providers         []P.ProxyProvider
 	failedTestMux     sync.Mutex
-	failedTimes       int
+	failedTimes       atomic.Int32
 	failedTime        time.Time
 	failedTesting     atomic.Bool
 	testTimeout       int
@@ -280,18 +280,20 @@ func (gb *GroupBase) onDialFailed(adapterType C.AdapterType, err error, fn func(
 		gb.failedTestMux.Lock()
 		defer gb.failedTestMux.Unlock()
 
-		gb.failedTimes++
-		if gb.failedTimes == 1 {
+		// Счётчик атомарный: его сбрасывают и завершение health-check, и залп
+		// форс-чека при смене сети — оба вне этого мьютекса.
+		failedTimes := int(gb.failedTimes.Add(1))
+		if failedTimes == 1 {
 			log.Debugln("ProxyGroup: %s first failed", gb.Name())
 			gb.failedTime = time.Now()
 		} else {
 			if time.Since(gb.failedTime) > time.Duration(gb.testTimeout)*time.Millisecond {
-				gb.failedTimes = 0
+				gb.failedTimes.Store(0)
 				return
 			}
 
-			log.Debugln("ProxyGroup: %s failed count: %d", gb.Name(), gb.failedTimes)
-			if gb.failedTimes >= gb.maxFailedTimes {
+			log.Debugln("ProxyGroup: %s failed count: %d", gb.Name(), failedTimes)
+			if failedTimes >= gb.maxFailedTimes {
 				log.Warnln("because %s failed multiple times, activate health check", gb.Name())
 				fn()
 			}
@@ -317,11 +319,30 @@ func (gb *GroupBase) healthCheck() {
 
 	wg.Wait()
 	gb.failedTesting.Store(false)
-	gb.failedTimes = 0
+	gb.failedTimes.Store(0)
+}
+
+// HealthCheckProviders — провайдеры группы. Их запрашивает залп форс-чека
+// (tunnel.ForceHealthCheckAll): у группы со списком proxies провайдер
+// собственный и в общей карте провайдеров его нет, а провайдеры из use: —
+// наоборот, общие и видны сразу нескольким группам. Залп собирает и те и
+// другие, чтобы форсить каждый провайдер ровно один раз: раньше группа
+// форсила своих сама, и один общий провайдер получал по залпу на каждую
+// ссылающуюся на него группу — вместо ускорения выходил шторм проб.
+func (gb *GroupBase) HealthCheckProviders() []P.ProxyProvider {
+	return gb.providers
+}
+
+// ResetFailedState сбрасывает счётчик неудач группы: он набран на прежнем
+// сетевом пути и к новому отношения не имеет. Флаг failedTesting намеренно не
+// трогается — им владеет та проверка, которая его выставила, и снимать его
+// поверх чужой идущей проверки нельзя.
+func (gb *GroupBase) ResetFailedState() {
+	gb.failedTimes.Store(0)
 }
 
 func (gb *GroupBase) onDialSuccess() {
 	if !gb.failedTesting.Load() {
-		gb.failedTimes = 0
+		gb.failedTimes.Store(0)
 	}
 }
